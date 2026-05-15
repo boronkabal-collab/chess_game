@@ -26,6 +26,8 @@
   let myKills = 0;
   let myHp = 100;
   let es = null;
+  let ws = null;
+  let wsReady = false;
   let connected = false;
 
   const keys = { w: false, a: false, s: false, d: false };
@@ -236,7 +238,8 @@
 
   function setMeta() {
     if (ui.meta) {
-      ui.meta.textContent = `Пуль: ${bulletMeshes.size} | на сервере: ${state.bullets?.length ?? 0} | счёт: ${myKills} | Babylon.js`;
+      const link = wsReady ? "WS" : connected ? "SSE" : "…";
+      ui.meta.textContent = `Связь: ${link} | пуль: ${bulletMeshes.size} | счёт: ${myKills}`;
     }
   }
 
@@ -332,12 +335,58 @@
     }
   }
 
+  function connectWs() {
+    if (ws) ws.close();
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws?playerId=${encodeURIComponent(playerId)}`);
+    ws.onopen = () => {
+      wsReady = true;
+      connected = true;
+      if (es) {
+        es.close();
+        es = null;
+      }
+      setInfo("Подключено (WebSocket). W — вперёд, S — назад.");
+    };
+    ws.onmessage = (e) => {
+      let msg;
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      if (msg.t === "state") applyState(msg.data);
+      if (msg.t === "you") applyYou(msg.data);
+      if (msg.t === "shot") {
+        const b = msg.data;
+        spawnBullet(b.id, b.x, b.z, b.vx, b.vz);
+      }
+      if (msg.t === "hit") {
+        const h = msg.data;
+        if (h.ownerId === playerId) {
+          myKills = h.kills ?? myKills;
+          hitFlashUntil = performance.now() + 400;
+          setInfo(`Попадание! Счёт: ${myKills}`);
+          updateHud();
+        }
+      }
+    };
+    ws.onclose = () => {
+      wsReady = false;
+      connected = false;
+      if (!es) connectSSE();
+    };
+    ws.onerror = () => {
+      wsReady = false;
+    };
+  }
+
   function connectSSE() {
-    if (es) es.close();
+    if (es || wsReady) return;
     es = new EventSource(`/api/events?playerId=${encodeURIComponent(playerId)}`);
     es.onopen = () => {
       connected = true;
-      setInfo("Подключено. Жёлтые сферы — пули.");
+      setInfo("Подключено (SSE). Жёлтые сферы — пули.");
     };
     es.addEventListener("state", (e) => applyState(JSON.parse(e.data)));
     es.addEventListener("you", (e) => applyYou(JSON.parse(e.data)));
@@ -373,30 +422,43 @@
     spawnBullet(`pred_${now}`, sx, sz, dx * 11, dz * 11);
     muzzleFlash();
 
+    const yawShot = camera.rotation.y;
+    if (wsReady && ws.readyState === 1) {
+      ws.send(JSON.stringify({ t: "shoot", yaw: yawShot }));
+      return;
+    }
     try {
-      await api("/api/input", {
-        playerId,
-        keys,
-        yaw: camera.rotation.y,
-      });
-      const res = await api("/api/shoot", { playerId, yaw: camera.rotation.y });
+      handlePlayerInputHttp(yawShot);
+      const res = await api("/api/shoot", { playerId, yaw: yawShot });
       if (res.bullet) {
         removeBullet(`pred_${now}`);
         spawnBullet(res.bullet.id, res.bullet.x, res.bullet.z, res.bullet.vx, res.bullet.vz);
       }
-      await pollState();
     } catch (e) {
       setInfo("Ошибка: " + e.message, true);
     }
   }
 
-  async function sendInput() {
+  function sendInput() {
     if (!playerId) return;
-    try {
-      await api("/api/input", { playerId, keys, yaw: camera.rotation.y });
-    } catch {
-      /* */
+    const yaw = camera.rotation.y;
+    if (wsReady && ws.readyState === 1) {
+      ws.send(JSON.stringify({ t: "input", keys, yaw }));
+      return;
     }
+    fetch("/api/input", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ playerId, keys, yaw }),
+    }).catch(() => {});
+  }
+
+  function handlePlayerInputHttp(yaw) {
+    fetch("/api/input", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ playerId, keys, yaw }),
+    }).catch(() => {});
   }
 
   async function joinGame() {
@@ -428,8 +490,8 @@
     if (!anyMoveKey()) return;
     let mx = 0;
     let mz = 0;
-    if (keys.w) mz -= 1;
-    if (keys.s) mz += 1;
+    if (keys.w) mz += 1;
+    if (keys.s) mz -= 1;
     if (keys.a) mx -= 1;
     if (keys.d) mx += 1;
     const len = Math.hypot(mx, mz) || 1;
@@ -504,9 +566,10 @@
 
   setInterval(() => {
     if (shooting) fire();
-    sendInput();
-  }, 45);
-  setInterval(pollState, 200);
+  }, 280);
+  setInterval(() => {
+    if (!wsReady) pollState();
+  }, 400);
 
   let lastTime = performance.now();
   engine.runRenderLoop(() => {
@@ -516,9 +579,11 @@
 
     applyLocalMove(dt);
 
+    sendInput();
+
     const me = state.players.find((p) => p.id === playerId);
     if (me) {
-      const blend = anyMoveKey() ? 0.2 : 0.5;
+      const blend = anyMoveKey() ? 0.12 : 0.35;
       camX += (me.x - camX) * blend;
       camZ += (me.z - camZ) * blend;
     }
@@ -540,6 +605,7 @@
     engine.resize();
     try {
       await joinGame();
+      connectWs();
       connectSSE();
       await pollState();
     } catch {

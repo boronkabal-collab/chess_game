@@ -7,7 +7,7 @@ const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC = path.join(__dirname, "public");
-const TICK_MS = 1000 / 30;
+const TICK_MS = 1000 / 60;
 const ARENA = 24;
 const WALL = 1.2;
 const PLAYER_SPEED = 7;
@@ -29,6 +29,7 @@ const MIME = {
 const players = new Map();
 const inputs = new Map();
 const sseByPlayer = new Map();
+const wsByPlayer = new Map();
 let bullets = [];
 
 let targets = [
@@ -188,6 +189,67 @@ function broadcastHit(info) {
       /* */
     }
   }
+  for (const sock of wsByPlayer.values()) {
+    wsSend(sock, { t: "hit", data: info });
+  }
+}
+
+function handleWsMessage(playerId, text) {
+  let msg;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (msg.t === "input") {
+    handlePlayerInput(playerId, msg.keys, msg.yaw);
+    return;
+  }
+  if (msg.t === "shoot") {
+    if (!players.has(playerId)) return;
+    const bullet = shoot(playerId, Number(msg.yaw) || 0);
+    if (bullet) {
+      bullets.push(bullet);
+      broadcastShot(bullet);
+    }
+    broadcast();
+  }
+}
+
+function applyPlayerMove(pl, inp, dt) {
+  let mx = 0;
+  let mz = 0;
+  if (inp.w) mz += 1;
+  if (inp.s) mz -= 1;
+  if (inp.a) mx -= 1;
+  if (inp.d) mx += 1;
+  const len = Math.hypot(mx, mz) || 1;
+  mx /= len;
+  mz /= len;
+
+  const sin = Math.sin(pl.yaw);
+  const cos = Math.cos(pl.yaw);
+  const nx = pl.x + (mx * cos + mz * sin) * PLAYER_SPEED * dt;
+  const nz = pl.z + (-mx * sin + mz * cos) * PLAYER_SPEED * dt;
+  if (!isBlocked(nx, pl.z)) pl.x = nx;
+  if (!isBlocked(pl.x, nz)) pl.z = nz;
+}
+
+function handlePlayerInput(playerId, keys, yaw) {
+  if (!players.has(playerId)) return;
+  const inp = {
+    w: Boolean(keys?.w),
+    a: Boolean(keys?.a),
+    s: Boolean(keys?.s),
+    d: Boolean(keys?.d),
+    yaw: Number(yaw) || 0,
+    at: Date.now(),
+  };
+  inputs.set(playerId, inp);
+  const pl = players.get(playerId);
+  if (!pl || pl.hp <= 0) return;
+  pl.yaw = inp.yaw;
+  applyPlayerMove(pl, inp, 1 / 60);
 }
 
 function gameTick() {
@@ -198,23 +260,7 @@ function gameTick() {
     const inp = inputs.get(pl.id);
     if (!inp || now - inp.at > 2000 || pl.hp <= 0) continue;
     pl.yaw = inp.yaw;
-
-    let mx = 0;
-    let mz = 0;
-    if (inp.w) mz -= 1;
-    if (inp.s) mz += 1;
-    if (inp.a) mx -= 1;
-    if (inp.d) mx += 1;
-    const len = Math.hypot(mx, mz) || 1;
-    mx /= len;
-    mz /= len;
-
-    const sin = Math.sin(pl.yaw);
-    const cos = Math.cos(pl.yaw);
-    const nx = pl.x + (mx * cos + mz * sin) * PLAYER_SPEED * dt;
-    const nz = pl.z + (-mx * sin + mz * cos) * PLAYER_SPEED * dt;
-    if (!isBlocked(nx, pl.z)) pl.x = nx;
-    if (!isBlocked(pl.x, nz)) pl.z = nz;
+    applyPlayerMove(pl, inp, dt);
   }
 
   const alive = [];
@@ -280,6 +326,60 @@ function personalState(playerId) {
   };
 }
 
+function wsSend(socket, obj) {
+  if (!socket || socket.destroyed) return;
+  const payload = Buffer.from(JSON.stringify(obj), "utf8");
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81;
+    header[1] = len;
+  } else {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  }
+  try {
+    socket.write(Buffer.concat([header, payload]));
+  } catch {
+    /* */
+  }
+}
+
+function wsParseFrame(buffer) {
+  if (buffer.length < 2) return null;
+  const opcode = buffer[0] & 0x0f;
+  if (opcode === 0x8) return { close: true, rest: buffer };
+  const masked = (buffer[1] & 0x80) !== 0;
+  let len = buffer[1] & 0x7f;
+  let off = 2;
+  if (len === 126) {
+    if (buffer.length < 4) return null;
+    len = buffer.readUInt16BE(2);
+    off = 4;
+  } else if (len === 127) return null;
+  if (masked) off += 4;
+  if (buffer.length < off + len) return null;
+  let data = buffer.slice(off, off + len);
+  if (masked) {
+    const mask = buffer.slice(off - 4, off);
+    for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+  }
+  return { text: data.toString("utf8"), rest: buffer.slice(off + len) };
+}
+
+function removePlayer(playerId) {
+  sseByPlayer.delete(playerId);
+  const sock = wsByPlayer.get(playerId);
+  if (sock && !sock.destroyed) sock.destroy();
+  wsByPlayer.delete(playerId);
+  players.delete(playerId);
+  inputs.delete(playerId);
+  bullets = bullets.filter((b) => b.ownerId !== playerId);
+}
+
 function broadcast() {
   const payload = publicState();
   const line = `event: state\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -291,23 +391,31 @@ function broadcast() {
       sseByPlayer.delete(pid);
     }
   }
+  for (const [pid, sock] of wsByPlayer) {
+    wsSend(sock, { t: "state", data: payload });
+    wsSend(sock, { t: "you", data: personalState(pid) });
+  }
 }
 
 function broadcastShot(bullet) {
   if (!bullet) return;
-  const data = JSON.stringify({
+  const shot = {
     id: bullet.id,
     x: bullet.x,
     z: bullet.z,
     vx: bullet.vx,
     vz: bullet.vz,
-  });
+  };
+  const data = JSON.stringify(shot);
   for (const res of sseByPlayer.values()) {
     try {
       res.write(`event: shot\ndata: ${data}\n\n`);
     } catch {
       /* */
     }
+  }
+  for (const sock of wsByPlayer.values()) {
+    wsSend(sock, { t: "shot", data: shot });
   }
 }
 
@@ -369,11 +477,12 @@ const server = http.createServer(async (req, res) => {
     res.write(`event: state\ndata: ${JSON.stringify(publicState())}\n\n`);
     res.write(`event: you\ndata: ${JSON.stringify(personalState(playerId))}\n\n`);
     req.on("close", () => {
-      sseByPlayer.delete(playerId);
-      players.delete(playerId);
-      inputs.delete(playerId);
-      bullets = bullets.filter((b) => b.ownerId !== playerId);
-      broadcast();
+      if (!wsByPlayer.has(playerId)) {
+        removePlayer(playerId);
+        broadcast();
+      } else {
+        sseByPlayer.delete(playerId);
+      }
     });
     return;
   }
@@ -446,14 +555,7 @@ const server = http.createServer(async (req, res) => {
       res.end("{}");
       return;
     }
-    inputs.set(body.playerId, {
-      w: Boolean(body.keys?.w),
-      a: Boolean(body.keys?.a),
-      s: Boolean(body.keys?.s),
-      d: Boolean(body.keys?.d),
-      yaw: Number(body.yaw) || 0,
-      at: Date.now(),
-    });
+    handlePlayerInput(body.playerId, body.keys, body.yaw);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -478,6 +580,59 @@ setInterval(() => {
     }
   }
 }, 12000);
+
+server.on("upgrade", (req, socket) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname !== "/ws") {
+    socket.destroy();
+    return;
+  }
+  const playerId = url.searchParams.get("playerId");
+  if (!playerId || !players.has(playerId)) {
+    socket.destroy();
+    return;
+  }
+  const key = req.headers["sec-websocket-key"];
+  if (!key) {
+    socket.destroy();
+    return;
+  }
+  const accept = crypto
+    .createHash("sha1")
+    .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+  );
+
+  wsByPlayer.set(playerId, socket);
+  socket._wsBuf = Buffer.alloc(0);
+  wsSend(socket, { t: "state", data: publicState() });
+  wsSend(socket, { t: "you", data: personalState(playerId) });
+
+  socket.on("data", (chunk) => {
+    socket._wsBuf = Buffer.concat([socket._wsBuf, chunk]);
+    for (;;) {
+      const frame = wsParseFrame(socket._wsBuf);
+      if (!frame) break;
+      socket._wsBuf = frame.rest;
+      if (frame.close) {
+        socket.destroy();
+        return;
+      }
+      if (frame.text) handleWsMessage(playerId, frame.text);
+    }
+  });
+
+  socket.on("close", () => {
+    wsByPlayer.delete(playerId);
+    if (!sseByPlayer.has(playerId)) {
+      removePlayer(playerId);
+      broadcast();
+    }
+  });
+});
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Arena Shooter: http://localhost:${PORT}`);
