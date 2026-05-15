@@ -21,8 +21,31 @@
           <div class="hp-bar"><div id="hpFill" class="hp-fill"></div></div>
           <p id="hudText">HP 100</p>
         </div>
-        <p id="overlay" class="overlay">Кликните, чтобы играть</p>
+        <p id="overlay" class="overlay hidden">Кликните, чтобы играть</p>
         <p id="boardMeta" class="meta">—</p>
+
+        <div id="loginScreen" class="modal-screen">
+          <div class="modal-card">
+            <h2>Вход в арену</h2>
+            <label class="field-label" for="nickInput">Ваш ник</label>
+            <input id="nickInput" class="text-input" type="text" maxlength="16" placeholder="Например: Снайпер" />
+            <p class="field-label">Команда</p>
+            <div class="team-pick">
+              <button type="button" id="teamBlue" class="team-btn team-btn--blue team-btn--active">Синие</button>
+              <button type="button" id="teamRed" class="team-btn team-btn--red">Красные</button>
+            </div>
+            <button type="button" id="joinBtn" class="btn btn-primary">В бой</button>
+            <p id="loginError" class="login-error"></p>
+          </div>
+        </div>
+
+        <div id="deathScreen" class="modal-screen hidden">
+          <div class="modal-card modal-card--death">
+            <h2>Вы погибли</h2>
+            <p id="deathMsg" class="death-msg">—</p>
+            <button type="button" id="respawnBtn" class="btn btn-primary">Возродиться</button>
+          </div>
+        </div>
       </section>
 
       <aside class="sidebar">
@@ -41,6 +64,6 @@
     </main>
   </div>
   <script src="https://cdn.babylonjs.com/babylon.js"></script>
-  <script src="app.js?v=20"></script>
+  <script src="app.js?v=21"></script>
 </body>
 </html>

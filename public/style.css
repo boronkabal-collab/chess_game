@@ -253,3 +253,113 @@ kbd {
 #board {
   cursor: default;
 }
+
+.modal-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 10, 18, 0.88);
+  border-radius: 10px;
+  pointer-events: auto;
+}
+
+.modal-screen.hidden {
+  display: none;
+}
+
+.modal-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  width: min(92%, 340px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.modal-card h2 {
+  margin: 0 0 1rem;
+  font-size: 1.25rem;
+}
+
+.modal-card--death h2 {
+  color: #ff6b6b;
+}
+
+.field-label {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.text-input {
+  width: 100%;
+  padding: 0.55rem 0.65rem;
+  margin-bottom: 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0c121c;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.team-pick {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.team-btn {
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  background: #0c121c;
+  color: var(--text);
+  transition: border-color 0.15s, transform 0.1s;
+}
+
+.team-btn--blue.team-btn--active {
+  border-color: #4488ff;
+  box-shadow: 0 0 12px rgba(68, 136, 255, 0.35);
+}
+
+.team-btn--red.team-btn--active {
+  border-color: #ff4455;
+  box-shadow: 0 0 12px rgba(255, 68, 85, 0.35);
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, #5a9aff, #3d78e0);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.08);
+}
+
+.login-error {
+  margin: 0.65rem 0 0;
+  min-height: 1.2em;
+  font-size: 0.85rem;
+  color: #ff6b6b;
+}
+
+.death-msg {
+  margin: 0 0 1rem;
+  color: var(--muted);
+  line-height: 1.5;
+}

@@ -39,20 +39,35 @@ let targets = [
   { id: "t4", x: 0, z: -6, hp: 100, maxHp: 100, hitUntil: 0 },
 ];
 
-function randomSpawn() {
-  const m = ARENA / 2 - 2;
-  return {
-    x: (Math.random() * 2 - 1) * m,
-    z: (Math.random() * 2 - 1) * m,
-    yaw: 0,
-  };
+function sanitizeName(name) {
+  const s = String(name || "")
+    .trim()
+    .replace(/[<>]/g, "")
+    .slice(0, 16);
+  return s || "Боец";
 }
 
-function respawn(pl) {
-  const s = randomSpawn();
+function normalizeTeam(team) {
+  return team === "red" ? "red" : "blue";
+}
+
+function teamSpawn(team) {
+  const m = ARENA / 2 - 3;
+  const z = (Math.random() * 2 - 1) * m;
+  if (team === "red") {
+    return { x: 5 + Math.random() * 2, z, yaw: Math.PI };
+  }
+  return { x: -5 - Math.random() * 2, z, yaw: 0 };
+}
+
+function respawnPlayer(pl) {
+  const s = teamSpawn(pl.team);
   pl.x = s.x;
   pl.z = s.z;
+  pl.yaw = s.yaw;
   pl.hp = PLAYER_HP;
+  pl.dead = false;
+  pl.lastKiller = null;
 }
 
 function arenaLimit() {
@@ -98,7 +113,7 @@ function segmentHitsCircle(ax, az, bx, bz, px, pz, radius) {
 
 function shoot(playerId, yaw) {
   const pl = players.get(playerId);
-  if (!pl || pl.hp <= 0) return null;
+  if (!pl || pl.dead || pl.hp <= 0) return null;
   const now = Date.now();
   if (now - pl.lastShot < FIRE_COOLDOWN_MS) return null;
   pl.lastShot = now;
@@ -151,20 +166,26 @@ function checkHits(b, ax, az, bx, bz, now) {
   }
 
   for (const pl of players.values()) {
-    if (pl.id === b.ownerId || pl.hp <= 0) continue;
+    if (pl.id === b.ownerId || pl.dead || pl.hp <= 0) continue;
+    const shooter = players.get(b.ownerId);
+    if (shooter && shooter.team === pl.team) continue;
     if (segmentHitsCircle(ax, az, bx, bz, pl.x, pl.z, PLAYER_HIT_R)) {
       pl.hp = Math.max(0, pl.hp - BULLET_DAMAGE);
       const killer = players.get(b.ownerId);
-      if (killer) killer.kills = (killer.kills || 0) + 1;
       let kill = false;
       if (pl.hp <= 0) {
         pl.hp = 0;
+        pl.dead = true;
+        pl.deaths = (pl.deaths || 0) + 1;
+        pl.lastKiller = killer?.name || "Неизвестно";
         kill = true;
-        const id = pl.id;
-        setTimeout(() => {
-          const p = players.get(id);
-          if (p) respawn(p);
-        }, 1200);
+        if (killer) killer.kills = (killer.kills || 0) + 1;
+        broadcastDeath({
+          victimId: pl.id,
+          victimName: pl.name,
+          killerId: b.ownerId,
+          killerName: pl.lastKiller,
+        });
       }
       broadcastHit({
         kind: "player",
@@ -172,12 +193,25 @@ function checkHits(b, ax, az, bx, bz, now) {
         ownerId: b.ownerId,
         hp: pl.hp,
         kill,
-        kills: players.get(b.ownerId)?.kills ?? 0,
+        kills: killer?.kills ?? 0,
       });
       return true;
     }
   }
   return false;
+}
+
+function broadcastDeath(info) {
+  for (const res of sseByPlayer.values()) {
+    try {
+      res.write(`event: death\ndata: ${JSON.stringify(info)}\n\n`);
+    } catch {
+      /* */
+    }
+  }
+  for (const sock of wsByPlayer.values()) {
+    wsSend(sock, { t: "death", data: info });
+  }
 }
 
 function broadcastHit(info) {
@@ -203,6 +237,15 @@ function handleWsMessage(playerId, text) {
   }
   if (msg.t === "input") {
     handlePlayerInput(playerId, msg.keys, msg.yaw, msg.x, msg.z);
+    return;
+  }
+  if (msg.t === "respawn") {
+    const pl = players.get(playerId);
+    if (pl && pl.dead) {
+      respawnPlayer(pl);
+      broadcast();
+      wsSend(wsByPlayer.get(playerId), { t: "respawned", data: personalState(playerId) });
+    }
     return;
   }
   if (msg.t === "shoot") {
@@ -242,6 +285,8 @@ function applyPlayerMove(pl, inp, dt) {
 
 function handlePlayerInput(playerId, keys, yaw, cx, cz) {
   if (!players.has(playerId)) return;
+  const pl = players.get(playerId);
+  if (pl.dead || pl.hp <= 0) return;
   const inp = {
     w: Boolean(keys?.w),
     a: Boolean(keys?.a),
@@ -253,8 +298,7 @@ function handlePlayerInput(playerId, keys, yaw, cx, cz) {
     cz: typeof cz === "number" ? cz : null,
   };
   inputs.set(playerId, inp);
-  const pl = players.get(playerId);
-  if (!pl || pl.hp <= 0) return;
+  if (!pl) return;
   pl.yaw = inp.yaw;
   if (inp.cx !== null && inp.cz !== null && !isBlocked(inp.cx, inp.cz)) {
     pl.x = inp.cx;
@@ -270,7 +314,7 @@ function gameTick() {
 
   for (const pl of players.values()) {
     const inp = inputs.get(pl.id);
-    if (!inp || now - inp.at > 2000 || pl.hp <= 0) continue;
+    if (!inp || now - inp.at > 2000 || pl.dead || pl.hp <= 0) continue;
     pl.yaw = inp.yaw;
     if (inp.cx !== null && inp.cz !== null && now - inp.at < 120) {
       if (!isBlocked(inp.cx, inp.cz)) {
@@ -312,10 +356,12 @@ function publicState() {
     players: [...players.values()].map((p) => ({
       id: p.id,
       name: p.name,
+      team: p.team,
       x: p.x,
       z: p.z,
       yaw: p.yaw,
       hp: p.hp,
+      dead: Boolean(p.dead),
     })),
     targets: targets.map((t) => ({
       id: t.id,
@@ -341,8 +387,12 @@ function personalState(playerId) {
   return {
     playerId,
     name: pl?.name,
+    team: pl?.team,
     hp: pl?.hp ?? 0,
     kills: pl?.kills ?? 0,
+    deaths: pl?.deaths ?? 0,
+    dead: Boolean(pl?.dead),
+    lastKiller: pl?.lastKiller ?? null,
   };
 }
 
@@ -516,21 +566,50 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/api/join") {
+    const body = await readBody(req);
     const id = `p_${crypto.randomBytes(6).toString("hex")}`;
-    const spawn = randomSpawn();
+    const team = normalizeTeam(body.team);
+    const name = sanitizeName(body.name);
+    const spawn = teamSpawn(team);
     players.set(id, {
       id,
-      name: `Боец ${players.size + 1}`,
+      name,
+      team,
       x: spawn.x,
       z: spawn.z,
-      yaw: 0,
+      yaw: spawn.yaw,
       hp: PLAYER_HP,
+      dead: false,
+      deaths: 0,
       lastShot: 0,
       kills: 0,
+      lastKiller: null,
     });
     broadcast();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ playerId: id, name: players.get(id).name }));
+    res.end(
+      JSON.stringify({
+        playerId: id,
+        name,
+        team,
+        teamName: team === "red" ? "Красные" : "Синие",
+      })
+    );
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/respawn") {
+    const body = await readBody(req);
+    const pl = players.get(body.playerId);
+    if (!pl) {
+      res.writeHead(404);
+      res.end("{}");
+      return;
+    }
+    if (pl.dead) respawnPlayer(pl);
+    broadcast();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, you: personalState(body.playerId) }));
     return;
   }
 

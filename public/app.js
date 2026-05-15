@@ -19,6 +19,15 @@
     crosshair: document.getElementById("crosshair"),
     hpFill: document.getElementById("hpFill"),
     hudText: document.getElementById("hudText"),
+    loginScreen: document.getElementById("loginScreen"),
+    nickInput: document.getElementById("nickInput"),
+    teamBlue: document.getElementById("teamBlue"),
+    teamRed: document.getElementById("teamRed"),
+    joinBtn: document.getElementById("joinBtn"),
+    loginError: document.getElementById("loginError"),
+    deathScreen: document.getElementById("deathScreen"),
+    deathMsg: document.getElementById("deathMsg"),
+    respawnBtn: document.getElementById("respawnBtn"),
   };
 
   let playerId = sessionStorage.getItem("arenaShooterId");
@@ -46,6 +55,15 @@
   let camReady = false;
   let hitFlashUntil = 0;
   let pointerLocked = false;
+  let selectedTeam = "blue";
+  let myTeam = "blue";
+  let myName = "";
+  let isDead = false;
+  let gameStarted = false;
+  const TEAM_COLORS = {
+    blue: new BABYLON.Color3(0.28, 0.5, 1),
+    red: new BABYLON.Color3(1, 0.28, 0.32),
+  };
 
   const canvas = document.createElement("canvas");
   canvas.tabIndex = 0;
@@ -303,7 +321,140 @@
 
   function updateHud() {
     if (ui.hpFill) ui.hpFill.style.width = Math.max(0, myHp) + "%";
-    if (ui.hudText) ui.hudText.textContent = `HP ${myHp} | убийств: ${myKills}`;
+    const teamLabel = myTeam === "red" ? "Красные" : "Синие";
+    if (ui.hudText) {
+      ui.hudText.textContent = `${myName} · ${teamLabel} · HP ${myHp} · убийств: ${myKills}`;
+    }
+  }
+
+  function makeNameLabel(name, team) {
+    const w = 256;
+    const h = 64;
+    const tex = new BABYLON.DynamicTexture(`nm_${name}_${team}`, { width: w, height: h }, scene, false);
+    const ctx = tex.getContext();
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.font = "bold 32px Segoe UI, Arial";
+    ctx.fillStyle = team === "red" ? "#ff8888" : "#88bbff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(name.slice(0, 14), w / 2, h / 2);
+    tex.update();
+    const plane = BABYLON.MeshBuilder.CreatePlane(`lbl_${name}`, { width: 2.4, height: 0.6 }, scene);
+    plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL;
+    const mat = new BABYLON.StandardMaterial(`lblm_${name}`, scene);
+    mat.diffuseTexture = tex;
+    mat.emissiveTexture = tex;
+    mat.disableLighting = true;
+    mat.backFaceCulling = false;
+    mat.useAlphaFromDiffuseTexture = true;
+    plane.material = mat;
+    return { plane, tex, name, team };
+  }
+
+  function disposePlayerVisual(rec) {
+    if (!rec) return;
+    if (rec.label?.plane) rec.label.plane.dispose();
+    if (rec.label?.tex) rec.label.tex.dispose();
+    if (rec.body) rec.body.dispose();
+  }
+
+  function ensurePlayerVisual(p) {
+    let rec = playerMeshes.get(p.id);
+    const team = p.team === "red" ? "red" : "blue";
+    const name = p.name || "Боец";
+    const visible = !p.dead && (p.hp ?? 100) > 0;
+
+    if (!rec) {
+      const body = BABYLON.MeshBuilder.CreateCylinder(
+        `pl_${p.id}`,
+        { height: 1.6, diameter: 1.1, tessellation: 12 },
+        scene
+      );
+      const pm = new BABYLON.StandardMaterial(`plMat_${p.id}`, scene);
+      pm.diffuseColor = TEAM_COLORS[team];
+      pm.emissiveColor = TEAM_COLORS[team].scale(0.35);
+      body.material = pm;
+      const label = makeNameLabel(name, team);
+      label.plane.parent = body;
+      label.plane.position.y = 1.35;
+      rec = { body, label, name, team };
+      playerMeshes.set(p.id, rec);
+    }
+
+    if (rec.name !== name || rec.team !== team) {
+      rec.label.plane.dispose();
+      rec.label.tex.dispose();
+      rec.label = makeNameLabel(name, team);
+      rec.label.plane.parent = rec.body;
+      rec.label.plane.position.y = 1.35;
+      rec.name = name;
+      rec.team = team;
+      rec.body.material.diffuseColor = TEAM_COLORS[team];
+      rec.body.material.emissiveColor = TEAM_COLORS[team].scale(0.35);
+    }
+
+    rec.body.position.set(p.x, 0.8, p.z);
+    rec.body.setEnabled(visible);
+    rec.label.plane.setEnabled(visible);
+    return rec;
+  }
+
+  function showDeathScreen(killerName) {
+    isDead = true;
+    if (document.pointerLockElement) document.exitPointerLock();
+    if (ui.deathMsg) {
+      ui.deathMsg.textContent = killerName
+        ? `Вас убил: ${killerName}`
+        : "Вы погибли в бою";
+    }
+    ui.deathScreen?.classList.remove("hidden");
+    ui.crosshair?.classList.add("hidden");
+    ui.hud?.classList.add("hidden");
+    ui.overlay?.classList.add("hidden");
+  }
+
+  function hideDeathScreen() {
+    isDead = false;
+    ui.deathScreen?.classList.add("hidden");
+    if (gameStarted) ui.overlay?.classList.remove("hidden");
+  }
+
+  async function requestRespawn() {
+    if (!playerId) return;
+    if (wsReady && ws.readyState === 1) {
+      ws.send(JSON.stringify({ t: "respawn" }));
+    } else {
+      try {
+        const res = await api("/api/respawn", { playerId });
+        if (res.you) applyYou(res.you);
+      } catch {
+        /* */
+      }
+    }
+    hideDeathScreen();
+    camReady = false;
+  }
+
+  function initLogin() {
+    const savedNick = sessionStorage.getItem("arenaNick");
+    if (savedNick && ui.nickInput) ui.nickInput.value = savedNick;
+    const savedTeam = sessionStorage.getItem("arenaTeam");
+    if (savedTeam === "red" || savedTeam === "blue") selectTeam(savedTeam);
+
+    ui.teamBlue?.addEventListener("click", () => selectTeam("blue"));
+    ui.teamRed?.addEventListener("click", () => selectTeam("red"));
+    ui.joinBtn?.addEventListener("click", () => enterGame());
+    ui.nickInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") enterGame();
+    });
+    ui.respawnBtn?.addEventListener("click", () => requestRespawn());
+  }
+
+  function selectTeam(team) {
+    selectedTeam = team === "red" ? "red" : "blue";
+    ui.teamBlue?.classList.toggle("team-btn--active", selectedTeam === "blue");
+    ui.teamRed?.classList.toggle("team-btn--active", selectedTeam === "red");
   }
 
   function setMeta() {
@@ -328,6 +479,12 @@
     if (!you) return;
     myHp = you.hp ?? myHp;
     myKills = you.kills ?? myKills;
+    if (you.name) myName = you.name;
+    if (you.team) myTeam = you.team;
+    const deadNow = Boolean(you.dead) || myHp <= 0;
+    if (deadNow && !isDead) showDeathScreen(you.lastKiller);
+    if (!deadNow && isDead) hideDeathScreen();
+    isDead = deadNow;
     updateHud();
   }
 
@@ -364,25 +521,20 @@
     for (const p of state.players) {
       if (p.id === playerId) continue;
       seenPlayers.add(p.id);
-      let m = playerMeshes.get(p.id);
-      if (!m) {
-        m = BABYLON.MeshBuilder.CreateCylinder(
-          `pl_${p.id}`,
-          { height: 1.6, diameter: 1.1, tessellation: 12 },
-          scene
-        );
-        const pm = new BABYLON.StandardMaterial(`plMat_${p.id}`, scene);
-        pm.diffuseColor = new BABYLON.Color3(0.9, 0.2, 0.2);
-        m.material = pm;
-        playerMeshes.set(p.id, m);
-      }
-      m.position.set(p.x, 0.8, p.z);
+      ensurePlayerVisual(p);
     }
-    for (const [id, m] of playerMeshes) {
+    for (const [id, rec] of playerMeshes) {
       if (!seenPlayers.has(id)) {
-        m.dispose();
+        disposePlayerVisual(rec);
         playerMeshes.delete(id);
       }
+    }
+
+    if (me) {
+      const deadNow = Boolean(me.dead) || (me.hp ?? 100) <= 0;
+      if (deadNow && !isDead) showDeathScreen(me.lastKiller || null);
+      if (!deadNow && isDead) hideDeathScreen();
+      isDead = deadNow;
     }
 
     const live = new Set();
@@ -446,6 +598,11 @@
           updateHud();
         }
       }
+      if (msg.t === "death") {
+        const d = msg.data;
+        if (d.victimId === playerId) showDeathScreen(d.killerName);
+      }
+      if (msg.t === "respawned") applyYou(msg.data);
     };
     ws.onclose = () => {
       wsReady = false;
@@ -481,13 +638,17 @@
         updateHud();
       }
     });
+    es.addEventListener("death", (e) => {
+      const d = JSON.parse(e.data);
+      if (d.victimId === playerId) showDeathScreen(d.killerName);
+    });
     es.onerror = () => {
       connected = false;
     };
   }
 
   function fire() {
-    if (!playerId) return;
+    if (!playerId || isDead) return;
     const now = performance.now();
     if (now - lastShot < FIRE_MS) return;
     lastShot = now;
@@ -510,7 +671,7 @@
   }
 
   function sendInput(force) {
-    if (!playerId) return;
+    if (!playerId || isDead) return;
     const yaw = camera.rotation.y;
     const payload = JSON.stringify({
       t: "input",
@@ -541,20 +702,41 @@
     }).catch(() => {});
   }
 
-  async function joinGame() {
-    if (playerId) {
-      try {
-        if ((await api(`/api/session?playerId=${encodeURIComponent(playerId)}`)).ok) return true;
-      } catch {
-        /* */
-      }
-    }
+  async function joinGame(nick, team) {
     sessionStorage.removeItem("arenaShooterId");
-    const data = await api("/api/join", {});
+    const data = await api("/api/join", { name: nick, team });
     playerId = data.playerId;
+    myName = data.name;
+    myTeam = data.team || team;
     sessionStorage.setItem("arenaShooterId", playerId);
-    setInfo(`${data.name} — клик по арене, ЛКМ / Пробел`);
-    return true;
+    sessionStorage.setItem("arenaNick", myName);
+    sessionStorage.setItem("arenaTeam", myTeam);
+    setInfo(`${myName} · ${data.teamName || myTeam} — клик по арене`);
+    return data;
+  }
+
+  async function enterGame() {
+    const nick = (ui.nickInput?.value || "").trim();
+    if (!nick) {
+      if (ui.loginError) ui.loginError.textContent = "Введите ник";
+      return;
+    }
+    if (ui.loginError) ui.loginError.textContent = "";
+    if (ui.joinBtn) ui.joinBtn.disabled = true;
+    try {
+      await joinGame(nick, selectedTeam);
+      ui.loginScreen?.classList.add("hidden");
+      gameStarted = true;
+      ui.overlay?.classList.remove("hidden");
+      connectWs();
+      connectSSE();
+      await pollState();
+    } catch (e) {
+      if (ui.loginError) ui.loginError.textContent = "Сервер недоступен";
+      console.error(e);
+    } finally {
+      if (ui.joinBtn) ui.joinBtn.disabled = false;
+    }
   }
 
   function setKeyFromCode(code, down) {
@@ -582,6 +764,7 @@
   }
 
   function applyLocalMove(dt) {
+    if (isDead) return;
     let mx = 0;
     let mz = 0;
     if (keys.w) mz += 1;
@@ -625,6 +808,7 @@
   }
 
   canvas.addEventListener("click", () => {
+    if (isDead || !gameStarted) return;
     canvas.focus();
     canvas.requestPointerLock?.();
     if (!camera._attached) {
@@ -709,17 +893,10 @@
 
   window.addEventListener("resize", () => engine.resize());
 
-  async function start() {
+  function start() {
     engine.resize();
-    try {
-      await joinGame();
-      connectWs();
-      connectSSE();
-      await pollState();
-    } catch {
-      setInfo("Запустите: cd E:\\crowd-chess && node server.js", true);
-      setTimeout(start, 3000);
-    }
+    initLogin();
+    setInfo("Введите ник и выберите команду");
   }
 
   start();
