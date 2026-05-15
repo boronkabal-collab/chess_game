@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crowd Chess</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Crowd Chess</h1>
+      <p class="tagline">Своя шахматная фигура · ходы по правилам · перетаскивание мышью</p>
+    </header>
+
+    <main class="layout">
+      <section class="arena-wrap">
+        <canvas id="board" tabindex="0" aria-label="Шахматная доска"></canvas>
+        <p id="boardMeta" class="meta">—</p>
+      </section>
+
+      <aside class="sidebar">
+        <div class="card">
+          <h2>Ваша фигура</h2>
+          <p id="playerInfo">Подключение…</p>
+          <button type="button" id="rerollPiece" class="btn secondary">Другая случайная фигура</button>
+        </div>
+
+        <div class="card">
+          <h2>Как ходить</h2>
+          <p class="hint">Зажмите <strong>свою</strong> фигуру и перетащите на подсвеченную клетку.</p>
+          <p class="hint">Пешка, конь, слон и т.д. ходят как в шахматах. Можно бить чужие фигуры.</p>
+          <p class="hint"><strong>http://localhost:3000</strong></p>
+        </div>
+      </aside>
+    </main>
+  </div>
+  <script src="chess-moves.js"></script>
+  <script src="app.js?v=4"></script>
+</body>
+</html>
