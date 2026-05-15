@@ -33,6 +33,10 @@
   const keys = { w: false, a: false, s: false, d: false };
   const KEY_CODES = { KeyW: "w", KeyA: "a", KeyS: "s", KeyD: "d" };
   const MOVE_SPEED = 7;
+  const ARENA_LIM = 12 - 1.2 - 0.55;
+  let serverX = 0;
+  let serverZ = 0;
+  let lastInputSent = "";
   let shooting = false;
   let lastShot = 0;
   let camX = 0;
@@ -267,6 +271,8 @@
 
     const me = state.players.find((p) => p.id === playerId);
     if (me) {
+      serverX = me.x;
+      serverZ = me.z;
       if (!camReady) {
         camX = me.x;
         camZ = me.z;
@@ -424,7 +430,7 @@
 
     const yawShot = camera.rotation.y;
     if (wsReady && ws.readyState === 1) {
-      ws.send(JSON.stringify({ t: "shoot", yaw: yawShot }));
+      ws.send(JSON.stringify({ t: "shoot", yaw: yawShot, x: camX, z: camZ }));
       return;
     }
     try {
@@ -439,17 +445,27 @@
     }
   }
 
-  function sendInput() {
+  function sendInput(force) {
     if (!playerId) return;
     const yaw = camera.rotation.y;
+    const payload = JSON.stringify({
+      t: "input",
+      keys: { ...keys },
+      yaw,
+      x: camX,
+      z: camZ,
+    });
+    if (!force && payload === lastInputSent) return;
+    lastInputSent = payload;
+
     if (wsReady && ws.readyState === 1) {
-      ws.send(JSON.stringify({ t: "input", keys, yaw }));
+      ws.send(payload);
       return;
     }
     fetch("/api/input", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerId, keys, yaw }),
+      body: JSON.stringify({ playerId, keys, yaw, x: camX, z: camZ }),
     }).catch(() => {});
   }
 
@@ -457,7 +473,7 @@
     fetch("/api/input", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerId, keys, yaw }),
+      body: JSON.stringify({ playerId, keys, yaw, x: camX, z: camZ }),
     }).catch(() => {});
   }
 
@@ -479,21 +495,36 @@
 
   function setKeyFromCode(code, down) {
     const k = KEY_CODES[code];
-    if (k) keys[k] = down;
+    if (!k) return;
+    if (keys[k] === down) return;
+    keys[k] = down;
+    if (down) {
+      applyLocalMove(1 / 60);
+      sendInput(true);
+    } else {
+      sendInput(true);
+    }
   }
 
   function anyMoveKey() {
     return keys.w || keys.a || keys.s || keys.d;
   }
 
+  function clampArena(x, z) {
+    return {
+      x: Math.max(-ARENA_LIM, Math.min(ARENA_LIM, x)),
+      z: Math.max(-ARENA_LIM, Math.min(ARENA_LIM, z)),
+    };
+  }
+
   function applyLocalMove(dt) {
-    if (!anyMoveKey()) return;
     let mx = 0;
     let mz = 0;
     if (keys.w) mz += 1;
     if (keys.s) mz -= 1;
     if (keys.a) mx -= 1;
     if (keys.d) mx += 1;
+    if (mx === 0 && mz === 0) return;
     const len = Math.hypot(mx, mz) || 1;
     mx /= len;
     mz /= len;
@@ -502,6 +533,24 @@
     const cos = Math.cos(yaw);
     camX += (mx * cos + mz * sin) * MOVE_SPEED * dt;
     camZ += (-mx * sin + mz * cos) * MOVE_SPEED * dt;
+    const c = clampArena(camX, camZ);
+    camX = c.x;
+    camZ = c.z;
+  }
+
+  function reconcileIdle(dt) {
+    if (anyMoveKey()) return;
+    const dx = serverX - camX;
+    const dz = serverZ - camZ;
+    const dist = Math.hypot(dx, dz);
+    if (dist > 4) {
+      camX = serverX;
+      camZ = serverZ;
+    } else if (dist > 0.2) {
+      const k = Math.min(1, dt * 3);
+      camX += dx * k;
+      camZ += dz * k;
+    }
   }
 
   function setPointerUi(locked) {
@@ -578,15 +627,9 @@
     lastTime = now;
 
     applyLocalMove(dt);
+    reconcileIdle(dt);
+    sendInput(false);
 
-    sendInput();
-
-    const me = state.players.find((p) => p.id === playerId);
-    if (me) {
-      const blend = anyMoveKey() ? 0.12 : 0.35;
-      camX += (me.x - camX) * blend;
-      camZ += (me.z - camZ) * blend;
-    }
     camera.position.x = camX;
     camera.position.y = 1.7;
     camera.position.z = camZ;

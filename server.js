@@ -202,11 +202,16 @@ function handleWsMessage(playerId, text) {
     return;
   }
   if (msg.t === "input") {
-    handlePlayerInput(playerId, msg.keys, msg.yaw);
+    handlePlayerInput(playerId, msg.keys, msg.yaw, msg.x, msg.z);
     return;
   }
   if (msg.t === "shoot") {
     if (!players.has(playerId)) return;
+    const pl = players.get(playerId);
+    if (pl && typeof msg.x === "number" && typeof msg.z === "number" && !isBlocked(msg.x, msg.z)) {
+      pl.x = msg.x;
+      pl.z = msg.z;
+    }
     const bullet = shoot(playerId, Number(msg.yaw) || 0);
     if (bullet) {
       bullets.push(bullet);
@@ -235,7 +240,7 @@ function applyPlayerMove(pl, inp, dt) {
   if (!isBlocked(pl.x, nz)) pl.z = nz;
 }
 
-function handlePlayerInput(playerId, keys, yaw) {
+function handlePlayerInput(playerId, keys, yaw, cx, cz) {
   if (!players.has(playerId)) return;
   const inp = {
     w: Boolean(keys?.w),
@@ -244,11 +249,18 @@ function handlePlayerInput(playerId, keys, yaw) {
     d: Boolean(keys?.d),
     yaw: Number(yaw) || 0,
     at: Date.now(),
+    cx: typeof cx === "number" ? cx : null,
+    cz: typeof cz === "number" ? cz : null,
   };
   inputs.set(playerId, inp);
   const pl = players.get(playerId);
   if (!pl || pl.hp <= 0) return;
   pl.yaw = inp.yaw;
+  if (inp.cx !== null && inp.cz !== null && !isBlocked(inp.cx, inp.cz)) {
+    pl.x = inp.cx;
+    pl.z = inp.cz;
+    return;
+  }
   applyPlayerMove(pl, inp, 1 / 60);
 }
 
@@ -260,6 +272,13 @@ function gameTick() {
     const inp = inputs.get(pl.id);
     if (!inp || now - inp.at > 2000 || pl.hp <= 0) continue;
     pl.yaw = inp.yaw;
+    if (inp.cx !== null && inp.cz !== null && now - inp.at < 120) {
+      if (!isBlocked(inp.cx, inp.cz)) {
+        pl.x = inp.cx;
+        pl.z = inp.cz;
+      }
+      continue;
+    }
     applyPlayerMove(pl, inp, dt);
   }
 
@@ -555,7 +574,7 @@ const server = http.createServer(async (req, res) => {
       res.end("{}");
       return;
     }
-    handlePlayerInput(body.playerId, body.keys, body.yaw);
+    handlePlayerInput(body.playerId, body.keys, body.yaw, body.x, body.z);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
