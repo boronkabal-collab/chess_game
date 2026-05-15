@@ -33,6 +33,8 @@
   const keys = { w: false, a: false, s: false, d: false };
   const KEY_CODES = { KeyW: "w", KeyA: "a", KeyS: "s", KeyD: "d" };
   const MOVE_SPEED = 7;
+  const BULLET_SPEED = 11;
+  const FIRE_MS = 300;
   const ARENA_LIM = 12 - 1.2 - 0.55;
   let serverX = 0;
   let serverZ = 0;
@@ -186,7 +188,7 @@
     trail.material = tmat;
     glowMesh(trail);
 
-    return { root, core, vx: 0, vz: 0 };
+    return { root, core, vx: 0, vz: 0, born: 0, local: false };
   }
 
   function setBulletVel(rec, vx, vz) {
@@ -196,7 +198,7 @@
     rec.root.rotation.y = angle;
   }
 
-  function spawnBullet(id, x, z, vx, vz) {
+  function spawnBullet(id, x, z, vx, vz, opts) {
     let rec = bulletMeshes.get(id);
     if (!rec) {
       rec = createBulletMesh(id);
@@ -204,6 +206,70 @@
     }
     rec.root.position.set(x, 1.65, z);
     setBulletVel(rec, vx, vz);
+    if (opts?.local) {
+      rec.local = true;
+      rec.born = opts.born ?? performance.now();
+    }
+  }
+
+  function spawnBeam(dx, dz) {
+    const y = 1.65;
+    const x0 = camX + dx * 0.6;
+    const z0 = camZ + dz * 0.6;
+    const len = 4;
+    const beam = BABYLON.MeshBuilder.CreateCylinder(
+      "beam",
+      { height: len, diameterTop: 0.08, diameterBottom: 0.35, tessellation: 6 },
+      scene
+    );
+    beam.position = new BABYLON.Vector3(x0 + (dx * len) / 2, y, z0 + (dz * len) / 2);
+    beam.rotation.y = Math.atan2(dx, dz);
+    beam.rotation.x = Math.PI / 2;
+    const mat = new BABYLON.StandardMaterial("beamMat", scene);
+    mat.emissiveColor = new BABYLON.Color3(0.3, 1, 1);
+    mat.disableLighting = true;
+    mat.alpha = 0.9;
+    beam.material = mat;
+    glowMesh(beam);
+    setTimeout(() => beam.dispose(), 90);
+  }
+
+  function fireLocalShot() {
+    const now = performance.now();
+    const yaw = camera.rotation.y;
+    const dx = Math.sin(yaw);
+    const dz = Math.cos(yaw);
+    const sx = camX + dx * 1.0;
+    const sz = camZ + dz * 1.0;
+    const id = `local_${now | 0}`;
+    spawnBullet(id, sx, sz, dx * BULLET_SPEED, dz * BULLET_SPEED, { local: true, born: now });
+    muzzleFlash();
+    spawnBeam(dx, dz);
+    return { id, yaw, dx, dz };
+  }
+
+  function removeNearestLocalBullet() {
+    let best = null;
+    let bestAge = Infinity;
+    for (const [id, rec] of bulletMeshes) {
+      if (!rec.local) continue;
+      const age = performance.now() - (rec.born || 0);
+      if (age < bestAge) {
+        bestAge = age;
+        best = id;
+      }
+    }
+    if (best) removeBullet(best);
+  }
+
+  function tickLocalBullets(now) {
+    for (const [id, rec] of [...bulletMeshes]) {
+      if (!rec.local) continue;
+      const age = now - (rec.born || 0);
+      const x = rec.root.position.x;
+      const z = rec.root.position.z;
+      if (age > 4000 || Math.abs(x) > 11.5 || Math.abs(z) > 11.5) removeBullet(id);
+    }
   }
 
   function removeBullet(id) {
@@ -321,10 +387,12 @@
 
     const live = new Set();
     for (const b of state.bullets || []) {
+      if (b.ownerId === playerId) continue;
       live.add(b.id);
       spawnBullet(b.id, b.x, b.z, b.vx, b.vz);
     }
     for (const id of [...bulletMeshes.keys()]) {
+      if (id.startsWith("local_")) continue;
       if (!live.has(id)) removeBullet(id);
     }
 
@@ -365,11 +433,13 @@
       if (msg.t === "you") applyYou(msg.data);
       if (msg.t === "shot") {
         const b = msg.data;
+        if (b.ownerId && b.ownerId === playerId) return;
         spawnBullet(b.id, b.x, b.z, b.vx, b.vz);
       }
       if (msg.t === "hit") {
         const h = msg.data;
         if (h.ownerId === playerId) {
+          removeNearestLocalBullet();
           myKills = h.kills ?? myKills;
           hitFlashUntil = performance.now() + 400;
           setInfo(`Попадание! Счёт: ${myKills}`);
@@ -398,11 +468,13 @@
     es.addEventListener("you", (e) => applyYou(JSON.parse(e.data)));
     es.addEventListener("shot", (e) => {
       const b = JSON.parse(e.data);
+      if (b.ownerId === playerId) return;
       spawnBullet(b.id, b.x, b.z, b.vx, b.vz);
     });
     es.addEventListener("hit", (e) => {
       const h = JSON.parse(e.data);
       if (h.ownerId === playerId) {
+        removeNearestLocalBullet();
         myKills = h.kills ?? myKills;
         hitFlashUntil = performance.now() + 400;
         setInfo(`Попадание! Счёт: ${myKills}`);
@@ -414,35 +486,27 @@
     };
   }
 
-  async function fire() {
+  function fire() {
     if (!playerId) return;
     const now = performance.now();
-    if (now - lastShot < 280) return;
+    if (now - lastShot < FIRE_MS) return;
     lastShot = now;
 
-    const yaw = camera.rotation.y;
-    const dx = Math.sin(yaw);
-    const dz = Math.cos(yaw);
-    const sx = camX + dx * 1.2;
-    const sz = camZ + dz * 1.2;
-    spawnBullet(`pred_${now}`, sx, sz, dx * 11, dz * 11);
-    muzzleFlash();
+    const shot = fireLocalShot();
+    const yawShot = shot.yaw;
 
-    const yawShot = camera.rotation.y;
     if (wsReady && ws.readyState === 1) {
-      ws.send(JSON.stringify({ t: "shoot", yaw: yawShot, x: camX, z: camZ }));
+      ws.send(
+        JSON.stringify({ t: "shoot", yaw: yawShot, x: camX, z: camZ, clientId: shot.id })
+      );
       return;
     }
-    try {
-      handlePlayerInputHttp(yawShot);
-      const res = await api("/api/shoot", { playerId, yaw: yawShot });
-      if (res.bullet) {
-        removeBullet(`pred_${now}`);
-        spawnBullet(res.bullet.id, res.bullet.x, res.bullet.z, res.bullet.vx, res.bullet.vz);
-      }
-    } catch (e) {
-      setInfo("Ошибка: " + e.message, true);
-    }
+    handlePlayerInputHttp(yawShot);
+    fetch("/api/shoot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ playerId, yaw: yawShot, x: camX, z: camZ }),
+    }).catch(() => {});
   }
 
   function sendInput(force) {
@@ -615,7 +679,7 @@
 
   setInterval(() => {
     if (shooting) fire();
-  }, 280);
+  }, FIRE_MS);
   setInterval(() => {
     if (!wsReady) pollState();
   }, 400);
@@ -638,6 +702,7 @@
       b.root.position.x += b.vx * dt;
       b.root.position.z += b.vz * dt;
     }
+    tickLocalBullets(now);
 
     scene.render();
   });

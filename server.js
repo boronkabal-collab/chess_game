@@ -327,6 +327,7 @@ function publicState() {
     })),
     bullets: bullets.map((b) => ({
       id: b.id,
+      ownerId: b.ownerId,
       x: b.x,
       z: b.z,
       vx: b.vx,
@@ -420,6 +421,7 @@ function broadcastShot(bullet) {
   if (!bullet) return;
   const shot = {
     id: bullet.id,
+    ownerId: bullet.ownerId,
     x: bullet.x,
     z: bullet.z,
     vx: bullet.vx,
