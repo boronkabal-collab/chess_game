@@ -1,7 +1,7 @@
 {
   "name": "crowd-chess",
   "version": "2.0.0",
-  "description": "Real-time crowd-controlled pieces on a dynamic board",
+  "description": "Online 3D arena shooter",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

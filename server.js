@@ -4,10 +4,21 @@ const path = require("path");
 const os = require("os");
 const { URL } = require("url");
 const crypto = require("crypto");
-const chess = require("./lib/chess-moves.js");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC = path.join(__dirname, "public");
+const TICK_MS = 1000 / 30;
+const ARENA = 24;
+const WALL = 1.2;
+const PLAYER_SPEED = 7;
+const BULLET_SPEED = 11;
+const BULLET_LIFE_MS = 4000;
+const FIRE_COOLDOWN_MS = 300;
+const PLAYER_HP = 100;
+const BULLET_DAMAGE = 25;
+const TARGET_HALF = 1.15;
+const PLAYER_HIT_R = 0.85;
+const HIT_SUBSTEP = 0.22;
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -15,138 +26,287 @@ const MIME = {
   ".js": "application/javascript; charset=utf-8",
 };
 
-/** @type {Map<string, { id: string, name: string, pieceId: string | null }>} */
 const players = new Map();
-/** @type {Map<string, import('http').ServerResponse>} */
+const inputs = new Map();
 const sseByPlayer = new Map();
+let bullets = [];
 
-/** @type {Array<{ id: string, ownerId: string, x: number, y: number, type: string, color: string, symbol: string, hue: number, hasMoved: boolean }>} */
-let pieces = [];
-let boardW = 8;
-let boardH = 8;
+let targets = [
+  { id: "t1", x: 6, z: 0, hp: 100, maxHp: 100, hitUntil: 0 },
+  { id: "t2", x: -6, z: 0, hp: 100, maxHp: 100, hitUntil: 0 },
+  { id: "t3", x: 0, z: 6, hp: 100, maxHp: 100, hitUntil: 0 },
+  { id: "t4", x: 0, z: -6, hp: 100, maxHp: 100, hitUntil: 0 },
+];
 
-function boardSizeForPlayers(n) {
-  const side = Math.max(8, Math.ceil(Math.sqrt(Math.max(1, n))) + 3);
-  return { w: side, h: side };
-}
-
-function resizeBoard() {
-  const { w, h } = boardSizeForPlayers(players.size);
-  boardW = w;
-  boardH = h;
-}
-
-function randomEmptyCell() {
-  const occupied = new Set(pieces.map((p) => `${p.x},${p.y}`));
-  for (let i = 0; i < 300; i++) {
-    const x = Math.floor(Math.random() * boardW);
-    const y = Math.floor(Math.random() * boardH);
-    if (!occupied.has(`${x},${y}`)) return { x, y };
-  }
-  return { x: Math.floor(boardW / 2), y: Math.floor(boardH / 2) };
-}
-
-function createPieceForPlayer(playerId) {
-  const pos = randomEmptyCell();
-  const type = chess.randomPieceType();
-  const color = chess.randomColor();
-  const piece = {
-    id: `piece_${playerId}`,
-    ownerId: playerId,
-    x: pos.x,
-    y: pos.y,
-    type,
-    color,
-    symbol: chess.SYMBOLS[color][type],
-    hue: color === "w" ? 210 : 0,
-    hasMoved: false,
+function randomSpawn() {
+  const m = ARENA / 2 - 2;
+  return {
+    x: (Math.random() * 2 - 1) * m,
+    z: (Math.random() * 2 - 1) * m,
+    yaw: 0,
   };
-  pieces.push(piece);
+}
+
+function respawn(pl) {
+  const s = randomSpawn();
+  pl.x = s.x;
+  pl.z = s.z;
+  pl.hp = PLAYER_HP;
+}
+
+function arenaLimit() {
+  return ARENA / 2 - WALL;
+}
+
+function isBlocked(x, z) {
+  const lim = arenaLimit();
+  return x < -lim || x > lim || z < -lim || z > lim;
+}
+
+/** Отрезок пересекает AABB мишени (XZ) */
+function segmentHitsBox(ax, az, bx, bz, cx, cz, hw, hd) {
+  const minX = cx - hw;
+  const maxX = cx + hw;
+  const minZ = cz - hd;
+  const maxZ = cz + hd;
+  const len = Math.hypot(bx - ax, bz - az);
+  const steps = Math.max(4, Math.ceil(len / HIT_SUBSTEP));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const px = ax + (bx - ax) * t;
+    const pz = az + (bz - az) * t;
+    if (px >= minX && px <= maxX && pz >= minZ && pz <= maxZ) return true;
+  }
+  return false;
+}
+
+/** Отрезок ближе radius к точке игрока */
+function segmentHitsCircle(ax, az, bx, bz, px, pz, radius) {
+  const len = Math.hypot(bx - ax, bz - az);
+  const steps = Math.max(4, Math.ceil(len / HIT_SUBSTEP));
+  const r2 = radius * radius;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = ax + (bx - ax) * t;
+    const z = az + (bz - az) * t;
+    const d2 = (x - px) ** 2 + (z - pz) ** 2;
+    if (d2 <= r2) return true;
+  }
+  return false;
+}
+
+function shoot(playerId, yaw) {
   const pl = players.get(playerId);
-  if (pl) pl.pieceId = piece.id;
-  return piece;
+  if (!pl || pl.hp <= 0) return null;
+  const now = Date.now();
+  if (now - pl.lastShot < FIRE_COOLDOWN_MS) return null;
+  pl.lastShot = now;
+  pl.yaw = yaw;
+
+  const dx = Math.sin(yaw);
+  const dz = Math.cos(yaw);
+  const x0 = pl.x + dx * 1.0;
+  const z0 = pl.z + dz * 1.0;
+  return {
+    id: `b_${crypto.randomBytes(4).toString("hex")}`,
+    ownerId: playerId,
+    x: x0,
+    z: z0,
+    px: x0,
+    pz: z0,
+    vx: dx * BULLET_SPEED,
+    vz: dz * BULLET_SPEED,
+    born: now,
+  };
 }
 
-function getPlayerPiece(playerId) {
-  return pieces.find((p) => p.ownerId === playerId);
+function hitTarget(t, ownerId, now) {
+  t.hp = Math.max(0, t.hp - BULLET_DAMAGE);
+  t.hitUntil = now + 400;
+  const killer = players.get(ownerId);
+  let destroyed = false;
+  if (killer) killer.kills = (killer.kills || 0) + 1;
+  if (t.hp <= 0) {
+    t.hp = t.maxHp;
+    destroyed = true;
+  }
+  return destroyed;
 }
 
-function applyMove(piece, toX, toY) {
-  const target = pieces.find((p) => p.x === toX && p.y === toY && p.id !== piece.id);
-  if (target) {
-    pieces = pieces.filter((p) => p.id !== target.id);
-    const victim = players.get(target.ownerId);
-    if (victim) {
-      victim.pieceId = null;
-      createPieceForPlayer(target.ownerId);
+function checkHits(b, ax, az, bx, bz, now) {
+  for (const t of targets) {
+    if (segmentHitsBox(ax, az, bx, bz, t.x, t.z, TARGET_HALF, TARGET_HALF)) {
+      const kill = hitTarget(t, b.ownerId, now);
+      broadcastHit({
+        kind: "target",
+        targetId: t.id,
+        ownerId: b.ownerId,
+        hp: t.hp,
+        kill,
+        kills: players.get(b.ownerId)?.kills ?? 0,
+      });
+      return true;
     }
   }
-  piece.x = toX;
-  piece.y = toY;
-  piece.hasMoved = true;
 
-  if (piece.type === "p") {
-    const promoRank = piece.color === "w" ? 0 : boardH - 1;
-    if (piece.y === promoRank) {
-      piece.type = "q";
-      piece.symbol = chess.SYMBOLS[piece.color].q;
+  for (const pl of players.values()) {
+    if (pl.id === b.ownerId || pl.hp <= 0) continue;
+    if (segmentHitsCircle(ax, az, bx, bz, pl.x, pl.z, PLAYER_HIT_R)) {
+      pl.hp = Math.max(0, pl.hp - BULLET_DAMAGE);
+      const killer = players.get(b.ownerId);
+      if (killer) killer.kills = (killer.kills || 0) + 1;
+      let kill = false;
+      if (pl.hp <= 0) {
+        pl.hp = 0;
+        kill = true;
+        const id = pl.id;
+        setTimeout(() => {
+          const p = players.get(id);
+          if (p) respawn(p);
+        }, 1200);
+      }
+      broadcastHit({
+        kind: "player",
+        victimId: pl.id,
+        ownerId: b.ownerId,
+        hp: pl.hp,
+        kill,
+        kills: players.get(b.ownerId)?.kills ?? 0,
+      });
+      return true;
     }
   }
+  return false;
+}
+
+function broadcastHit(info) {
+  const line = `event: hit\ndata: ${JSON.stringify(info)}\n\n`;
+  for (const res of sseByPlayer.values()) {
+    try {
+      res.write(line);
+    } catch {
+      /* */
+    }
+  }
+}
+
+function gameTick() {
+  const now = Date.now();
+  const dt = TICK_MS / 1000;
+
+  for (const pl of players.values()) {
+    const inp = inputs.get(pl.id);
+    if (!inp || now - inp.at > 2000 || pl.hp <= 0) continue;
+    pl.yaw = inp.yaw;
+
+    let mx = 0;
+    let mz = 0;
+    if (inp.w) mz -= 1;
+    if (inp.s) mz += 1;
+    if (inp.a) mx -= 1;
+    if (inp.d) mx += 1;
+    const len = Math.hypot(mx, mz) || 1;
+    mx /= len;
+    mz /= len;
+
+    const sin = Math.sin(pl.yaw);
+    const cos = Math.cos(pl.yaw);
+    const nx = pl.x + (mx * cos + mz * sin) * PLAYER_SPEED * dt;
+    const nz = pl.z + (-mx * sin + mz * cos) * PLAYER_SPEED * dt;
+    if (!isBlocked(nx, pl.z)) pl.x = nx;
+    if (!isBlocked(pl.x, nz)) pl.z = nz;
+  }
+
+  const alive = [];
+  for (const b of bullets) {
+    if (now - b.born > BULLET_LIFE_MS) continue;
+
+    const ax = b.x;
+    const az = b.z;
+    b.x += b.vx * dt;
+    b.z += b.vz * dt;
+
+    if (isBlocked(b.x, b.z)) continue;
+
+    if (checkHits(b, ax, az, b.x, b.z, now)) continue;
+
+    b.px = b.x;
+    b.pz = b.z;
+    alive.push(b);
+  }
+  bullets = alive;
+
+  broadcast();
 }
 
 function publicState() {
+  const now = Date.now();
   return {
-    boardW,
-    boardH,
+    arena: ARENA,
     playerCount: players.size,
-    pieces: pieces.map((p) => ({
+    players: [...players.values()].map((p) => ({
       id: p.id,
+      name: p.name,
       x: p.x,
-      y: p.y,
-      type: p.type,
-      color: p.color,
-      symbol: p.symbol,
-      hue: p.hue,
-      ownerId: p.ownerId,
-      hasMoved: p.hasMoved,
+      z: p.z,
+      yaw: p.yaw,
+      hp: p.hp,
+    })),
+    targets: targets.map((t) => ({
+      id: t.id,
+      x: t.x,
+      z: t.z,
+      hp: t.hp,
+      maxHp: t.maxHp,
+      hit: t.hitUntil > now,
+    })),
+    bullets: bullets.map((b) => ({
+      id: b.id,
+      x: b.x,
+      z: b.z,
+      vx: b.vx,
+      vz: b.vz,
     })),
   };
 }
 
 function personalState(playerId) {
   const pl = players.get(playerId);
-  const piece = getPlayerPiece(playerId);
-  let legalMoves = [];
-  if (piece) {
-    legalMoves = chess.getLegalMoves(piece, boardW, boardH, pieces);
-  }
   return {
     playerId,
     name: pl?.name,
-    pieceId: piece?.id ?? null,
-    piece: piece
-      ? {
-          id: piece.id,
-          x: piece.x,
-          y: piece.y,
-          type: piece.type,
-          color: piece.color,
-          symbol: piece.symbol,
-          typeName: chess.TYPE_NAMES[piece.type],
-        }
-      : null,
-    legalMoves,
+    hp: pl?.hp ?? 0,
+    kills: pl?.kills ?? 0,
   };
 }
 
 function broadcast() {
-  const stateLine = `event: state\ndata: ${JSON.stringify(publicState())}\n\n`;
+  const payload = publicState();
+  const line = `event: state\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const [pid, res] of sseByPlayer) {
     try {
-      res.write(stateLine);
+      res.write(line);
       res.write(`event: you\ndata: ${JSON.stringify(personalState(pid))}\n\n`);
     } catch {
       sseByPlayer.delete(pid);
+    }
+  }
+}
+
+function broadcastShot(bullet) {
+  if (!bullet) return;
+  const data = JSON.stringify({
+    id: bullet.id,
+    x: bullet.x,
+    z: bullet.z,
+    vx: bullet.vx,
+    vz: bullet.vz,
+  });
+  for (const res of sseByPlayer.values()) {
+    try {
+      res.write(`event: shot\ndata: ${data}\n\n`);
+    } catch {
+      /* */
     }
   }
 }
@@ -181,18 +341,12 @@ function serveStatic(res, urlPath) {
   fs.readFile(filePath, (err, data) => {
     if (err) {
       res.writeHead(404);
-      res.end("Not found");
+      res.end();
       return;
     }
     res.writeHead(200, { "Content-Type": MIME[path.extname(filePath)] || "application/octet-stream" });
     res.end(data);
   });
-}
-
-function removePlayer(playerId) {
-  players.delete(playerId);
-  pieces = pieces.filter((p) => p.ownerId !== playerId);
-  resizeBoard();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -216,7 +370,9 @@ const server = http.createServer(async (req, res) => {
     res.write(`event: you\ndata: ${JSON.stringify(personalState(playerId))}\n\n`);
     req.on("close", () => {
       sseByPlayer.delete(playerId);
-      removePlayer(playerId);
+      players.delete(playerId);
+      inputs.delete(playerId);
+      bullets = bullets.filter((b) => b.ownerId !== playerId);
       broadcast();
     });
     return;
@@ -229,73 +385,75 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/api/legal-moves") {
-    const playerId = url.searchParams.get("playerId");
-    const piece = getPlayerPiece(playerId);
-    const moves = piece ? chess.getLegalMoves(piece, boardW, boardH, pieces) : [];
+  if (req.method === "POST" && url.pathname === "/api/join") {
+    const id = `p_${crypto.randomBytes(6).toString("hex")}`;
+    const spawn = randomSpawn();
+    players.set(id, {
+      id,
+      name: `Боец ${players.size + 1}`,
+      x: spawn.x,
+      z: spawn.z,
+      yaw: 0,
+      hp: PLAYER_HP,
+      lastShot: 0,
+      kills: 0,
+    });
+    broadcast();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ moves }));
+    res.end(JSON.stringify({ playerId: id, name: players.get(id).name }));
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/join") {
-    const id = `p_${crypto.randomBytes(6).toString("hex")}`;
-    const name = `Игрок ${players.size + 1}`;
-    players.set(id, { id, name, pieceId: null });
-    resizeBoard();
-    const piece = createPieceForPlayer(id);
+  if (req.method === "POST" && url.pathname === "/api/shoot") {
+    const body = await readBody(req);
+    if (!players.has(body.playerId)) {
+      res.writeHead(404);
+      res.end("{}");
+      return;
+    }
+    const bullet = shoot(body.playerId, Number(body.yaw) || 0);
+    if (bullet) {
+      bullets.push(bullet);
+      broadcastShot(bullet);
+    }
     broadcast();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
-        playerId: id,
-        name,
-        piece: {
-          symbol: piece.symbol,
-          typeName: chess.TYPE_NAMES[piece.type],
-          x: piece.x,
-          y: piece.y,
-        },
+        ok: Boolean(bullet),
+        bulletId: bullet?.id ?? null,
+        bullet: bullet
+          ? { id: bullet.id, x: bullet.x, z: bullet.z, vx: bullet.vx, vz: bullet.vz }
+          : null,
       })
     );
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/move") {
-    const body = await readBody(req);
-    const { playerId, toX, toY } = body;
-    const piece = getPlayerPiece(playerId);
-    if (!piece) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ ok: false, error: "no_piece" }));
-      return;
-    }
-    const tx = Number(toX);
-    const ty = Number(toY);
-    if (!chess.canMove(piece, tx, ty, boardW, boardH, pieces)) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "illegal" }));
-      return;
-    }
-    applyMove(piece, tx, ty);
-    broadcast();
+  if (req.method === "GET" && url.pathname === "/api/state") {
+    const pid = url.searchParams.get("playerId");
+    const payload = publicState();
+    if (pid && players.has(pid)) payload.you = personalState(pid);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify(payload));
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/reroll-piece") {
+  if (req.method === "POST" && url.pathname === "/api/input") {
     const body = await readBody(req);
-    const playerId = body.playerId;
-    if (!players.has(playerId)) {
+    if (!players.has(body.playerId)) {
       res.writeHead(404);
       res.end("{}");
       return;
     }
-    pieces = pieces.filter((p) => p.ownerId !== playerId);
-    resizeBoard();
-    createPieceForPlayer(playerId);
-    broadcast();
+    inputs.set(body.playerId, {
+      w: Boolean(body.keys?.w),
+      a: Boolean(body.keys?.a),
+      s: Boolean(body.keys?.s),
+      d: Boolean(body.keys?.d),
+      yaw: Number(body.yaw) || 0,
+      at: Date.now(),
+    });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -310,7 +468,22 @@ const server = http.createServer(async (req, res) => {
   res.end();
 });
 
-resizeBoard();
+setInterval(gameTick, TICK_MS);
+setInterval(() => {
+  for (const res of sseByPlayer.values()) {
+    try {
+      res.write(": ping\n\n");
+    } catch {
+      /* */
+    }
+  }
+}, 12000);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Arena Shooter: http://localhost:${PORT}`);
+  for (const ip of lanAddresses()) console.log(`  LAN: http://${ip}:${PORT}`);
+  console.log(__dirname);
+});
 
 function lanAddresses() {
   const ips = [];
@@ -321,11 +494,3 @@ function lanAddresses() {
   }
   return ips;
 }
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Crowd Chess (этот ПК):  http://localhost:${PORT}`);
-  for (const ip of lanAddresses()) {
-    console.log(`Crowd Chess (в сети):    http://${ip}:${PORT}`);
-  }
-  console.log(`Папка: ${__dirname}`);
-});
